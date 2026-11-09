@@ -1,0 +1,25 @@
+import socket
+import matplotlib.pyplot as plt
+
+s = socket.socket()
+s.bind(("0.0.0.0", 50505))
+
+s.listen(100)
+print("Waiting for image...")
+conn, addr = s.accept()
+print("Connected to:", addr)
+f = open("received.jpg", "wb")
+data = conn.recv(999999999)
+while data:
+    f.write(data)
+    data = conn.recv(9999999999)
+    
+f.close()
+conn.close()
+s.close()
+
+print("Image received!")
+img = plt.imread("received.jpg")
+plt.imshow(img)
+plt.axis("off")
+plt.show()
