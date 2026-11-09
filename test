@@ -1,0 +1,28 @@
+import socket
+import threading
+
+
+DEFAULT_PORT = 50505
+
+MY_NAME = input("Name: ").strip()
+
+MY_PORT = int(input(f"Your listening port [{50505}]: ") or DEFAULT_PORT)
+NEXT_IP = input("Next student's IP address: 10.220.36.162").strip()
+NEXT_PORT = int(input(f"Next student's port [{50505}]: ") or DEFAULT_PORT)
+
+ready_event = threading.Event()
+
+def receive_json(conn):
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = conn.recv(99999)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > 99999:
+            raise ValueError("Token is too large")
+
+    if not data:
+        return None
+
+    return json.loads(data.decode("utf-8").strip())
