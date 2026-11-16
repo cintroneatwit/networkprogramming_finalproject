@@ -2,7 +2,7 @@ import socket
 import matplotlib.pyplot as plt
 import time
 from PIL import Image
-#import os
+import os
 
 s = socket.socket()
 s.bind(("0.0.0.0", 50505))
