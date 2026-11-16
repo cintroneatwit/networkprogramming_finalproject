@@ -1,0 +1,160 @@
+"""PixDrop - Week 2 sender
+
+Send one JPG/PNG image, or all supported images in one folder, to a
+PixDrop receiver using a single TCP connection. No accounts or cloud.
+
+Start the receiver first. Then run:
+    python pixdrop_sender.py
+Or supply the address and image/folder path:
+    python pixdrop_sender.py 127.0.0.1 "C:/Users/You/Pictures"
+
+Both PixDrop Week 2 files use the same simple protocol:
+  4-byte big-endian header length, JSON {filename, size, sha256},
+  then exactly 'size' image bytes, repeated for every image.
+  Closing the connection means all images have been sent.
+"""
+
+# ------------------------------------------------------------
+# PART 1: IMPORTS AND SETTINGS
+# ------------------------------------------------------------
+import hashlib
+import json
+import socket
+import sys
+import time
+from pathlib import Path
+
+PORT = 50505
+CHUNK_SIZE = 4096
+IMAGE_TYPES = (".jpg", ".jpeg", ".png")
+MAX_IMAGE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB per image
+
+
+# ------------------------------------------------------------
+# PART 2: FIND IMAGES IN A FILE OR FOLDER
+# ------------------------------------------------------------
+def find_images(selected_path):
+    """Return a list of JPG/JPEG/PNG files (not subfolders)."""
+    path = Path(selected_path).expanduser()
+
+    if path.is_file():
+        images = [path] if path.suffix.lower() in IMAGE_TYPES else []
+    elif path.is_dir():
+        images = sorted(
+            (item for item in path.iterdir()
+             if item.is_file() and item.suffix.lower() in IMAGE_TYPES),
+            key=lambda item: item.name.lower(),
+        )
+    else:
+        raise FileNotFoundError(f"Could not find: {path}")
+
+    if not images:
+        raise ValueError("No JPG, JPEG, or PNG images found in that location.")
+    return images
+
+
+# ------------------------------------------------------------
+# PART 3: CREATE A HEADER FOR EACH IMAGE
+# ------------------------------------------------------------
+def file_checksum(path):
+    """Calculate a fingerprint so receiver can check the file arrived unchanged."""
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while True:
+            piece = file.read(CHUNK_SIZE)
+            if not piece:
+                break
+            digest.update(piece)
+    return digest.hexdigest()
+
+
+def send_header(connection, path):
+    size = path.stat().st_size
+    if not 0 < size <= MAX_IMAGE_SIZE:
+        raise ValueError(f"Image size must be between 1 byte and 2 GB: {path.name}")
+
+    header = {
+        "filename": path.name,
+        "size": size,
+        "sha256": file_checksum(path),
+    }
+    data = json.dumps(header).encode("utf-8")
+    connection.sendall(len(data).to_bytes(4, "big"))
+    connection.sendall(data)
+    return size
+
+
+# ------------------------------------------------------------
+# PART 4: SEND ONE IMAGE IN SMALL CHUNKS
+# ------------------------------------------------------------
+def send_image(connection, path):
+    size = send_header(connection, path)
+    sent = 0
+    start = time.perf_counter()
+
+    with path.open("rb") as file:
+        while True:
+            piece = file.read(CHUNK_SIZE)
+            if not piece:
+                break
+            connection.sendall(piece)
+            sent += len(piece)
+
+    if sent != size:
+        raise RuntimeError(f"File changed while sending: {path.name}")
+
+    elapsed = time.perf_counter() - start
+    speed = (size / 1024 / 1024) / elapsed if elapsed > 0 else 0
+    print(f"  Sent: {path.name} | {size:,} bytes | {elapsed:.3f}s | {speed:.2f} MB/s")
+    return size
+
+
+# ------------------------------------------------------------
+# PART 5: SEND ALL IMAGES OVER ONE CONNECTION
+# ------------------------------------------------------------
+def send_images(ip_address, images):
+    total_bytes = 0
+    total_start = time.perf_counter()
+
+    with socket.create_connection((ip_address, PORT), timeout=10) as connection:
+        connection.settimeout(60)
+        print(f"Connected to {ip_address}:{PORT}")
+        for number, path in enumerate(images, start=1):
+            print(f"[{number}/{len(images)}] {path.name}")
+            total_bytes += send_image(connection, path)
+
+    elapsed = time.perf_counter() - total_start
+    print("\nTransfer finished")
+    print(f"Images sent: {len(images)}")
+    print(f"Total size: {total_bytes / (1024 * 1024):.2f} MB")
+    print(f"Elapsed time: {elapsed:.2f} seconds")
+    print("Check the receiver to confirm all files were saved and verified.")
+
+
+# ------------------------------------------------------------
+# PART 6: RUN THE PROGRAM
+# ------------------------------------------------------------
+def main():
+    print("=== PixDrop | Week 2 Sender ===")
+    if len(sys.argv) >= 3:
+        ip_address = sys.argv[1].strip()
+        selected_path = sys.argv[2].strip().strip('"')
+    else:
+        ip_address = input("Receiver's IPv4 address: ").strip()
+        selected_path = input("Image or folder path: ").strip().strip('"')
+
+    if not ip_address or not selected_path:
+        print("Please provide an IP address and an image or folder path.")
+        return
+
+    try:
+        images = find_images(selected_path)
+        print(f"Found {len(images)} image(s) to send.\n")
+        send_images(ip_address, images)
+    except (OSError, ValueError, RuntimeError, ConnectionError) as error:
+        print(f"\nCould not complete transfer: {error}")
+        print("If connecting timed out, check the receiver's IP, firewall, and Wi-Fi isolation.")
+
+
+if __name__ == "__main__":
+    main()
