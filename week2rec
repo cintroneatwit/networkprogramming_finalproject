@@ -1,0 +1,219 @@
+"""PixDrop - Week 2 receiver
+
+Receives multiple JPG/JPEG/PNG files over one TCP connection and saves
+files separately under 'received_images' next to this script.
+
+Start this receiver BEFORE starting pixdrop_sender.py.
+The sender and receiver must use the same PixDrop header protocol.
+
+This local-network prototype is NOT encrypted or authenticated.
+Only use it on a network you trust.
+"""
+
+# ------------------------------------------------------------
+# PART 1: IMPORTS AND SETTINGS
+# ------------------------------------------------------------
+import hashlib
+import json
+import socket
+import time
+from pathlib import Path
+
+HOST = "0.0.0.0"  # Allow connections from other computers on local network
+PORT = 50505
+CHUNK_SIZE = 4096
+MAX_HEADER_SIZE = 4096
+MAX_IMAGE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+IMAGE_TYPES = (".jpg", ".jpeg", ".png")
+SAVE_FOLDER = Path(__file__).resolve().parent / "received_images"
+SHOW_LAST_IMAGE = False  # Set True to preview last image in Spyder (needs Pillow + matplotlib)
+
+
+# ------------------------------------------------------------
+# PART 2: RECEIVE EXACTLY N BYTES (TCP RETURNS CHUNKS)
+# ------------------------------------------------------------
+def receive_exact(connection, amount):
+    data = bytearray()
+    while len(data) < amount:
+        piece = connection.recv(amount - len(data))
+        if not piece:
+            if not data:
+                return None  # Connection ended between images
+            raise ConnectionError("Connection closed midway through the header")
+        data.extend(piece)
+    return bytes(data)
+
+
+# ------------------------------------------------------------
+# PART 3: READ THE IMAGE'S NAME, SIZE, AND CHECKSUM
+# ------------------------------------------------------------
+def receive_header(connection):
+    length_bytes = receive_exact(connection, 4)
+    if length_bytes is None:
+        return None  # Sender closed connection after its last image
+
+    header_length = int.from_bytes(length_bytes, "big")
+    if not 0 < header_length <= MAX_HEADER_SIZE:
+        raise ValueError("Bad header length")
+
+    header_bytes = receive_exact(connection, header_length)
+    if header_bytes is None:
+        raise ConnectionError("Missing image header")
+
+    header = json.loads(header_bytes.decode("utf-8"))
+    name = header["filename"]
+    size = header["size"]
+    checksum = header.get("sha256")
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("Invalid filename")
+    # Do not let a sender save files outside the PixDrop folder.
+    name = name.replace("\\", "/").split("/")[-1]
+    if name in ("", ".", "..") or not name.lower().endswith(IMAGE_TYPES):
+        raise ValueError("Only JPG, JPEG, and PNG files are accepted")
+    if type(size) is not int or not 0 < size <= MAX_IMAGE_SIZE:
+        raise ValueError("Invalid image size")
+    if checksum is not None and (not isinstance(checksum, str) or len(checksum) != 64
+                                 or any(c not in "0123456789abcdef" for c in checksum)):
+        raise ValueError("Invalid checksum")
+
+    return name, size, checksum
+
+
+# ------------------------------------------------------------
+# PART 4: FIND A FILENAME THAT DOESN'T OVERWRITE ANYTHING
+# ------------------------------------------------------------
+def available_path(name):
+    root = SAVE_FOLDER / name
+    candidate = root
+    number = 2
+    while candidate.exists() or candidate.with_name(candidate.name + ".part").exists():
+        candidate = SAVE_FOLDER / f"{root.stem} ({number}){root.suffix}"
+        number += 1
+    return candidate
+
+
+# ------------------------------------------------------------
+# PART 5: RECEIVE AND VERIFY ONE IMAGE
+# ------------------------------------------------------------
+def receive_image(connection, name, size, checksum):
+    destination = available_path(name)
+    temporary = destination.with_name(destination.name + ".part")
+    remaining = size
+    digest = hashlib.sha256()
+    start = time.perf_counter()
+
+    try:
+        with temporary.open("wb") as file:
+            while remaining > 0:
+                piece = connection.recv(min(CHUNK_SIZE, remaining))
+                if not piece:
+                    raise ConnectionError(f"Connection ended during {name}")
+                file.write(piece)
+                digest.update(piece)
+                remaining -= len(piece)
+
+        if checksum is not None and digest.hexdigest() != checksum:
+            raise ValueError(f"Checksum mismatch for {name}; image wasn't saved")
+
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+    elapsed = time.perf_counter() - start
+    speed = (size / 1024 / 1024) / elapsed if elapsed > 0 else 0
+    resolution = get_resolution(destination)
+    print(f"  Saved: {destination.name} | {size:,} bytes | {resolution} | "
+          f"{elapsed:.3f}s | {speed:.2f} MB/s")
+    if checksum:
+        print("  SHA-256 verification: OK")
+    return destination
+
+
+# ------------------------------------------------------------
+# PART 6: OPTIONAL IMAGE DETAILS / SPYDER PREVIEW
+# ------------------------------------------------------------
+def get_resolution(path):
+    try:
+        from PIL import Image
+        with Image.open(path) as image:
+            width, height = image.size
+        return f"{width}x{height}"
+    except (ImportError, OSError):
+        return "resolution unavailable"
+
+
+def show_image(path):
+    if not SHOW_LAST_IMAGE or path is None:
+        return
+    try:
+        from PIL import Image
+        import matplotlib.pyplot as plt
+        with Image.open(path) as image:
+            image_data = image.copy()
+        plt.figure()
+        plt.imshow(image_data)
+        plt.title(path.name)
+        plt.axis("off")
+        plt.show()
+    except (ImportError, OSError) as error:
+        print(f"Image preview unavailable: {error}")
+
+
+# ------------------------------------------------------------
+# PART 7: HANDLE MANY IMAGES FROM ONE SENDER
+# ------------------------------------------------------------
+def handle_sender(connection, address):
+    print(f"\nConnected to: {address[0]}:{address[1]}")
+    count = 0
+    total_bytes = 0
+    last_image = None
+    start = time.perf_counter()
+
+    try:
+        while True:
+            info = receive_header(connection)
+            if info is None:
+                break
+            name, size, checksum = info
+            print(f"Receiving: {name}")
+            last_image = receive_image(connection, name, size, checksum)
+            count += 1
+            total_bytes += size
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError, json.JSONDecodeError) as error:
+        print(f"Transfer stopped: {error}")
+
+    elapsed = time.perf_counter() - start
+    print(f"Session finished: {count} image(s), {total_bytes / (1024 * 1024):.2f} MB "
+          f"in {elapsed:.2f}s")
+    show_image(last_image)
+
+
+# ------------------------------------------------------------
+# PART 8: START THE RECEIVER SERVER
+# ------------------------------------------------------------
+def main():
+    SAVE_FOLDER.mkdir(parents=True, exist_ok=True)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((HOST, PORT))
+        server.listen(5)
+        print("=== PixDrop | Week 2 Receiver ===")
+        print(f"Listening on port {PORT}...")
+        print(f"Saving images to: {SAVE_FOLDER}")
+        print("Press Ctrl+C to stop.\n")
+        while True:
+            connection, address = server.accept()
+            with connection:
+                connection.settimeout(60)
+                handle_sender(connection, address)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nPixDrop receiver stopped.")
+    except OSError as error:
+        print(f"PixDrop receiver could not start: {error}")
