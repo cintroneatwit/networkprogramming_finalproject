@@ -1,0 +1,165 @@
+"""PixDrop sender (no server). Start the receiver first, then run this."""
+
+import json
+import os
+import socket
+import time
+
+PORT = 50505                  # TCP port the receiver listens on
+HEADER_SIZE = 1000            # Every header is exactly this many bytes
+CHUNK_SIZE = 4096             # How many bytes to send at a time
+IMAGE_TYPES = (".jpg", ".jpeg", ".png")
+MAX_MESSAGE = 200             # Longest message, so it fits in the header
+
+
+def find_images(path):
+    if os.path.isfile(path):
+        return [path]
+    images = []
+    for name in sorted(os.listdir(path)):
+        if name.lower().endswith(IMAGE_TYPES):
+            images.append(os.path.join(path, name))
+    return images
+
+
+def make_header(filename, size, message):
+    info = {"filename": filename, "size": size, "message": message}
+    header = json.dumps(info, ensure_ascii=False).encode()
+    padding = b" " * (HEADER_SIZE - len(header))
+    return header + padding
+
+
+def receive_exact(connection, amount):
+    data = b""
+    while len(data) < amount:
+        piece = connection.recv(amount - len(data))
+        if piece == b"":
+            return None       # The receiver closed the connection
+        data = data + piece
+    return data
+
+
+def send_image(connection, path, message):
+    filename = os.path.basename(path)
+    size = os.path.getsize(path)
+    connection.sendall(make_header(filename, size, message))
+
+    sent = 0
+    start = time.time()
+    file = open(path, "rb")
+    while True:
+        piece = file.read(CHUNK_SIZE)
+        if piece == b"":
+            break             # Reached the end of the file
+        connection.sendall(piece)
+        sent = sent + len(piece)
+        print("  " + str(sent * 100 // size) + "%", end="\r")
+    file.close()
+
+    seconds = time.time() - start
+    speed = 0
+    if seconds > 0:
+        speed = size / 1024 / 1024 / seconds
+    print(f"  Sent {filename} | {size:,} bytes | {seconds:.2f} s | {speed:.2f} MB/s")
+    return size, speed
+
+
+def print_summary(results):
+    if len(results) == 0:
+        return
+    largest = results[0]
+    smallest = results[0]
+    fastest = results[0]
+    slowest = results[0]
+    for image in results:
+        if image["size"] > largest["size"]:
+            largest = image
+        if image["size"] < smallest["size"]:
+            smallest = image
+        if image["speed"] > fastest["speed"]:
+            fastest = image
+        if image["speed"] < slowest["speed"]:
+            slowest = image
+
+    print(f"Largest:  {largest['name']} ({largest['size'] / 1024 / 1024:.2f} MB)")
+    print(f"Smallest: {smallest['name']} ({smallest['size'] / 1024 / 1024:.2f} MB)")
+    print(f"Fastest:  {fastest['name']} ({fastest['speed']:.2f} MB/s)")
+    print(f"Slowest:  {slowest['name']} ({slowest['speed']:.2f} MB/s)")
+
+
+def send_images(ip, images, message):
+    count = 0
+    total = 0
+    results = []              # Stats for each confirmed image
+    start = time.time()
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    connection.settimeout(10)
+
+    try:
+        connection.connect((ip, PORT))
+        print("Connected to " + ip)
+        for path in images:
+            print("Sending " + os.path.basename(path))
+            size, speed = send_image(connection, path, message)
+            message = ""      # Only send the message once, with the first image
+            reply = receive_exact(connection, 1)
+            if reply != b"X":
+                print("  The receiver didn't confirm it - stopping")
+                break
+            print("  Receiver confirmed it")
+            count = count + 1
+            total = total + size
+            results.append({"name": os.path.basename(path), "size": size, "speed": speed})
+    except OSError as error:
+        print("Transfer stopped: " + str(error))
+    connection.close()
+
+    seconds = time.time() - start
+    megabytes = total / 1024 / 1024
+    speed = 0
+    if seconds > 0:
+        speed = megabytes / seconds
+    print(f"\n{count}/{len(images)} images sent")
+    if count < len(images):
+        not_sent = []
+        for path in images[count:]:
+            not_sent.append(os.path.basename(path))
+        print("Not sent: " + ", ".join(not_sent))
+
+    print(f"Total: {megabytes:.2f} MB in {seconds:.2f} s | average {speed:.2f} MB/s")
+    if count > 0:
+        print(f"Average image size: {megabytes / count:.2f} MB")
+    print_summary(results)
+
+
+def main():
+    print("=== PixDrop | Sender ===")
+    images = []
+    while True:
+        path = input("Image or folder path (type send when done): ").strip().strip('"')
+        if path.lower() == "send":
+            break
+        if path == "":
+            continue
+        if not os.path.exists(path):
+            print("  Can't find that - check the path")
+            continue
+        found = find_images(path)
+        images = images + found
+        print(f"  Added {len(found)} image(s), {len(images)} in total")
+
+    if len(images) == 0:
+        print("No images to send.")
+        return
+
+    message = input("Message to send with the images (press Enter to skip): ").strip()
+    if len(message) > MAX_MESSAGE:
+        message = message[:MAX_MESSAGE]
+        print(f"(Message shortened to {MAX_MESSAGE} characters)")
+
+    ip = input("Receiver's IP address: ").strip()
+
+    send_images(ip, images, message)
+
+
+main()
