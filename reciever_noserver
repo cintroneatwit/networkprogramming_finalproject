@@ -1,0 +1,136 @@
+"""PixDrop receiver (no server). Run this first, then run the sender."""
+
+import json
+import os
+import socket
+import time
+
+PORT = 50505                  # TCP port the images arrive on
+HEADER_SIZE = 1000            # Every header is exactly this many bytes
+CHUNK_SIZE = 4096             # How many bytes to read at a time
+SAVE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "received_images")
+SHOW_IMAGES = True            # Show each image in Spyder's Plots pane
+
+
+def receive_exact(connection, amount):
+    data = b""
+    while len(data) < amount:
+        piece = connection.recv(amount - len(data))
+        if piece == b"":
+            return None       # The sender closed the connection
+        data = data + piece
+    return data
+
+
+def get_save_path(filename):
+    name, extension = os.path.splitext(filename)
+    path = os.path.join(SAVE_FOLDER, filename)
+    number = 2
+    while os.path.exists(path):
+        path = os.path.join(SAVE_FOLDER, name + " (" + str(number) + ")" + extension)
+        number = number + 1
+    return path
+
+
+def receive_image(connection, filename, size):
+    path = get_save_path(filename)
+    received = 0
+    start = time.time()
+
+    file = open(path, "wb")
+    while received < size:
+        amount = min(CHUNK_SIZE, size - received)
+        piece = connection.recv(amount)
+        if piece == b"":
+            file.close()
+            print("  The sender disconnected in the middle of " + filename)
+            return None
+        file.write(piece)
+        received = received + len(piece)
+        print("  " + str(received * 100 // size) + "%", end="\r")
+    file.close()
+
+    seconds = time.time() - start
+    speed = 0
+    if seconds > 0:
+        speed = size / 1024 / 1024 / seconds
+    print(f"  Saved {os.path.basename(path)} | {size:,} bytes | {get_resolution(path)} | "
+          f"{seconds:.2f} s | {speed:.2f} MB/s")
+    return path
+
+
+def get_resolution(path):
+    try:
+        import matplotlib.pyplot as plt
+        image = plt.imread(path)
+        return f"{image.shape[1]}x{image.shape[0]}"
+    except Exception:
+        return "unknown resolution"
+
+
+def show_image(path):
+    if not SHOW_IMAGES:
+        return
+    try:
+        import matplotlib.pyplot as plt
+        plt.imshow(plt.imread(path))
+        plt.title(os.path.basename(path))
+        plt.axis("off")
+        plt.show()
+    except Exception:
+        print("  (Couldn't show a preview of this file)")
+
+
+def handle_sender(connection):
+    count = 0
+    total = 0
+    start = time.time()
+    while True:
+        header_bytes = receive_exact(connection, HEADER_SIZE)
+        if header_bytes is None:
+            break             # No more images
+        text = header_bytes.decode().strip()
+        header = json.loads(text)
+        filename = header["filename"]
+        size = header["size"]
+        message = header["message"]
+        if message != "":
+            print("\nMessage from sender: " + message)
+
+        print("Receiving " + filename)
+        path = receive_image(connection, filename, size)
+        if path is None:
+            break
+        connection.sendall(b"X")
+        count = count + 1
+        total = total + size
+        show_image(path)
+
+    seconds = time.time() - start
+    megabytes = total / 1024 / 1024
+    print(f"Finished: {count} image(s) | {megabytes:.2f} MB in {seconds:.2f} s\n")
+
+
+def main():
+    print("=== PixDrop | Receiver ===")
+    os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("0.0.0.0", PORT))
+    server.listen()
+    print("Waiting for a sender on port " + str(PORT))
+    print("Type this IP on the sender: " + socket.gethostbyname(socket.gethostname()))
+    print("(If that doesn't work, run ipconfig and use the Wi-Fi IPv4 address)")
+    print("Saving images to " + SAVE_FOLDER)
+
+    while True:
+        connection, address = server.accept()
+        print("\nConnected to " + address[0])
+        try:
+            handle_sender(connection)
+        except (OSError, ValueError) as error:
+            print("Transfer stopped: " + str(error))
+        connection.close()
+
+
+main()
